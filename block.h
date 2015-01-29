@@ -31,6 +31,10 @@
 
 #define INTER_ONCE	-1
 #define INTER_REPEAT	-2
+#define INTER_BLOCKING	-3
+
+#define READY_STDOUT 1
+#define READY_STDERR 2
 
 /* Block command exit codes */
 #define EXIT_URGENT	'!' /* 33 */
@@ -48,7 +52,7 @@
 	_(separator,             8,    PROP_I3BAR | PROP_BOOLEAN) \
 	_(separator_block_width, 8,    PROP_I3BAR | PROP_NUMBER) \
 	_(command,               1024,              PROP_STRING) \
-	_(interval,              8,                 PROP_STRING | PROP_NUMBER) \
+	_(interval,              10,                PROP_STRING | PROP_NUMBER) \
 	_(signal,                8,                 PROP_NUMBER) \
 	_(label,                 32,                PROP_STRING) \
 
@@ -92,6 +96,7 @@ struct block {
 
 void block_setup(struct block *);
 void block_spawn(struct block *, struct click *);
+int block_read_std(struct block *, int code, int fd_ready);
 void block_reap(struct block *);
 
 #endif /* _BLOCK_H */

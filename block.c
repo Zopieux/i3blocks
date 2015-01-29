@@ -193,39 +193,26 @@ block_spawn(struct block *block, struct click *click)
 	bdebug(block, "forked child %d at %ld", block->pid, now);
 }
 
-void
-block_reap(struct block *block)
+int
+block_read_std(struct block *block, int code, int fd_ready)
 {
 	struct properties *props = &block->updated_props;
 
 	char buf[2048] = { 0 };
 	char *lines = buf;
-	int status, code;
 
-	if (block->pid <= 0) {
-		bdebug(block, "not spawned yet");
-		return;
-	}
+	if ((fd_ready & READY_STDERR) == READY_STDERR) {
+		/* Note read(2) returns 0 for end-of-pipe */
+		if (read(block->err, buf, sizeof(buf)) == -1) {
+			berrorx(block, "read stderr");
+			mark_as_failed(block, strerror(errno));
+			return 1;
+		}
 
-	if (waitpid(block->pid, &status, 0) == -1) {
-		berrorx(block, "waitpid(%d)", block->pid);
-		mark_as_failed(block, strerror(errno));
-		goto close;
-	}
-
-	code = WEXITSTATUS(status);
-	bdebug(block, "process %d exited with %d", block->pid, code);
-
-	/* Note read(2) returns 0 for end-of-pipe */
-	if (read(block->err, buf, sizeof(buf)) == -1) {
-		berrorx(block, "read stderr");
-		mark_as_failed(block, strerror(errno));
-		goto close;
-	}
-
-	if (*buf) {
-		bdebug(block, "stderr:\n{\n%s\n}", buf);
-		memset(buf, 0, sizeof(buf));
+		if (*buf) {
+			bdebug(block, "stderr:\n{\n%s\n}", buf);
+			memset(buf, 0, sizeof(buf));
+		}
 	}
 
 	if (code != 0 && code != EXIT_URGENT) {
@@ -238,14 +225,17 @@ block_reap(struct block *block)
 
 		berror(block, "%s", reason);
 		mark_as_failed(block, reason);
-		goto close;
+		return 1;
 	}
+
+	if ((fd_ready & READY_STDOUT) != READY_STDOUT)
+		goto update_done;
 
 	/* Note read(2) returns 0 for end-of-pipe */
 	if (read(block->out, buf, sizeof(buf)) == -1) {
 		berrorx(block, "read stdout");
 		mark_as_failed(block, strerror(errno));
-		goto close;
+		return 1;
 	}
 
 	/* The update went ok, so reset the defaults and merge the output */
@@ -262,7 +252,32 @@ block_reap(struct block *block)
 		strcpy(props->full_text, concat);
 	}
 
+update_done:
 	bdebug(block, "updated successfully");
+	return 0;
+}
+
+void
+block_reap(struct block *block)
+{
+	int status, code;
+
+	if (block->pid <= 0) {
+		bdebug(block, "not spawned yet");
+		return;
+	}
+
+	if (waitpid(block->pid, &status, 0) == -1) {
+		berrorx(block, "waitpid(%d)", block->pid);
+		mark_as_failed(block, strerror(errno));
+		goto close;
+	}
+
+	code = WEXITSTATUS(status);
+	bdebug(block, "process %d exited with %d", block->pid, code);
+
+	block_read_std(block, code, READY_STDOUT | READY_STDERR);
+
 close:
 	if (close(block->out) == -1)
 		berrorx(block, "close stdout");
@@ -282,6 +297,8 @@ void block_setup(struct block *block)
 		block->interval = INTER_ONCE;
 	else if (strcmp(defaults->interval, "repeat") == 0)
 		block->interval = INTER_REPEAT;
+	else if (strcmp(defaults->interval, "blocking") == 0)
+		block->interval = INTER_BLOCKING;
 	else
 		block->interval = atoi(defaults->interval);
 	block->signal = atoi(defaults->signal);

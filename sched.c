@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/signalfd.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -34,6 +35,17 @@
 #include "log.h"
 
 static sigset_t sigset;
+static int sigfd;
+
+static void
+copy_fd_set(fd_set *dest, const fd_set *source, int nfds)
+{
+	int i;
+	FD_ZERO(dest);
+	for (i = 0; i < nfds; i++)
+		if (FD_ISSET(i, source))
+			FD_SET(i, dest);
+}
 
 static unsigned int
 longest_sleep(struct bar *bar)
@@ -121,6 +133,13 @@ setup_signals(void)
 
 #undef ADD_SIG
 
+	/* Create the signalfd for later select() */
+	sigfd = signalfd(-1, &sigset, 0);
+	if (sigfd == -1) {
+		errorx("signalfd");
+		return 1;
+	}
+
 	/* Block signals for which we are interested in waiting */
 	if (sigprocmask(SIG_SETMASK, &sigset, NULL) == -1) {
 		errorx("sigprocmask");
@@ -171,7 +190,10 @@ sched_init(struct bar *bar)
 void
 sched_start(struct bar *bar)
 {
-	int sig;
+	fd_set rfds, rfds_read, rfds_exc;
+	struct signalfd_siginfo fdsi;
+	ssize_t size_read;
+	int nfds, avail_fds, updated, sig;
 
 	/*
 	 * Initial display (for static blocks and loading labels),
@@ -180,44 +202,121 @@ sched_start(struct bar *bar)
 	json_print_bar(bar);
 	bar_poll_timed(bar);
 
+	FD_ZERO(&rfds);
+
+	nfds = 0;
+
+#define MAX(a, b) (a > b ? a : b)
+#define ADD_FD(_fd) do { FD_SET(_fd, &rfds); nfds = MAX(_fd, nfds); } while(0)
+
+	/* Add signal fd */
+	ADD_FD(sigfd);
+
+	/* Add out and err fds for all INTER_BLOCKING blocks */
+	for (int i = 0; i < bar->num; ++i) {
+		struct block *block = bar->blocks + i;
+		if (block->interval == INTER_BLOCKING) {
+			ADD_FD(block->out);
+			ADD_FD(block->err);
+		}
+	}
+
+#undef ADD_FD
+#undef MAX
+
+	if (nfds != 0)
+		/* select(2): highest-numbered file descriptor, plus 1 */
+		nfds++;
+
 	while (1) {
-		sig = sigwaitinfo(&sigset, NULL);
-		if (sig == -1) {
+
+		copy_fd_set(&rfds_read, &rfds, nfds);
+		copy_fd_set(&rfds_exc, &rfds, nfds);
+		avail_fds = select(nfds, &rfds_read, NULL, &rfds_exc, NULL);
+
+		if (avail_fds == -1) {
 			/* Hiding the bar may interrupt this system call */
 			if (errno == EINTR)
 				continue;
 
-			errorx("sigwaitinfo");
+			errorx("select");
+
+			for (int i = 0; i < bar->num; ++i) {
+				struct block *block = bar->blocks + i;
+				if (block->interval != INTER_BLOCKING)
+					continue;
+				/* Faulty block fd */
+				if (FD_ISSET(block->out, &rfds_exc) || FD_ISSET(block->err, &rfds_exc)) {
+					berror(block, "broken stdout/err");
+					/* Remove this block err and out from observed fds */
+					FD_CLR(block->out, &rfds);
+					FD_CLR(block->err, &rfds);
+					block_read_std(block, 1, 0);
+				}
+			}
+
+		} else if (avail_fds == 0) {
+			error("should not happen: select returned 0 (timeout)");
 			break;
 		}
 
-		debug("received signal %d (%s)", sig, strsignal(sig));
+		if (FD_ISSET(sigfd, &rfds_read)) {
+			avail_fds--;
 
-		if (sig == SIGTERM || sig == SIGINT)
-			break;
+			/* Signal received */
+			size_read = read(sigfd, &fdsi, sizeof(struct signalfd_siginfo));
+			if (size_read != sizeof(struct signalfd_siginfo)) {
+				errorx("read");
+				break;
+			}
 
-		/* Interval tick? */
-		if (sig == SIGALRM) {
-			bar_poll_outdated(bar);
+			sig = fdsi.ssi_signo;
+			debug("received signal %d (%s)", sig, strsignal(sig));
 
-		/* Child(ren) dead? */
-		} else if (sig == SIGCHLD) {
-			bar_poll_exited(bar);
+			if (sig == SIGTERM || sig == SIGINT)
+				break;
+
+			/* Interval tick? */
+			if (sig == SIGALRM) {
+				bar_poll_outdated(bar);
+
+			/* Child(ren) dead? */
+			} else if (sig == SIGCHLD) {
+				bar_poll_exited(bar);
+				json_print_bar(bar);
+
+			/* Block clicked? */
+			} else if (sig == SIGIO) {
+				bar_poll_clicked(bar);
+
+			/* Blocks signaled? */
+			} else if (sig > SIGRTMIN && sig <= SIGRTMAX) {
+				bar_poll_signaled(bar, sig - SIGRTMIN);
+
+			/* Deprecated signals? */
+			} else if (sig == SIGUSR1 || sig == SIGUSR2) {
+				error("SIGUSR{1,2} are deprecated, ignoring.");
+
+			} else debug("unhandled signal %d", sig);
+		}
+
+		if (!avail_fds)
+			continue;
+
+		updated = 0;
+		for (int i = 0; i < bar->num; ++i) {
+			struct block *block = bar->blocks + i;
+			if (block->interval == INTER_BLOCKING) {
+				int ready_out = FD_ISSET(block->out, &rfds_read) ? READY_STDOUT : 0;
+				int ready_err = FD_ISSET(block->err, &rfds_read) ? READY_STDERR : 0;
+				if (ready_out | ready_err) {
+					block_read_std(block, 0, ready_out | ready_err);
+					updated = 1;
+				}
+			}
+		}
+		if (updated)
 			json_print_bar(bar);
-
-		/* Block clicked? */
-		} else if (sig == SIGIO) {
-			bar_poll_clicked(bar);
-
-		/* Blocks signaled? */
-		} else if (sig > SIGRTMIN && sig <= SIGRTMAX) {
-			bar_poll_signaled(bar, sig - SIGRTMIN);
-
-		/* Deprecated signals? */
-		} else if (sig == SIGUSR1 || sig == SIGUSR2) {
-			error("SIGUSR{1,2} are deprecated, ignoring.");
-
-		} else debug("unhandled signal %d", sig);
 	}
 
 	/*
